@@ -1,0 +1,317 @@
+const netaddr = require('netaddr');
+const readline = require('readline');
+
+const services = {};  // { service: { srcnet: [dstnet1, dstnet2, ...] }, ... }
+let policy = {};
+const starNets = {};  // { [srcnet1, srcnet2, ...]: [dstnet1, dstnet2, ...], ... }
+let mode = '';  // True if addr srv, False if addr1 addr2 srv
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+});
+
+function debug(string, level = 1) {
+  if (args.verbose >= level) {
+    console.log(string);
+  }
+}
+
+function checkLine(line) {
+  line = line.trim();
+  if (line.includes('host')) {
+    debug(line, 0);
+    console.error("'host' word not expected");
+    process.exit(1);
+  }
+  line = line.replace(/\bany\b/g, '0.0.0.0 0.0.0.0');
+  if (line.split(' ').length === 3) {
+    return true;
+  } else if (line.split(' ').length === 5) {
+    return false;
+  } else {
+    debug(line, 0);
+    console.error("Too few or too many parameters. Expected:\n network mask proto:port\n or\n srcaddr src mask dstaddr dstmask proto:port");
+    process.exit(1);
+  }
+}
+
+function rtor(arr, srv) {
+  const port1 = parseInt(srv[0]);
+  const port2 = parseInt(srv[1]);
+  for (let i = port1; i <= port2; i++) {
+    arr.push(i);
+  }
+}
+
+function srvadd(port, arr) {
+  if (port.includes('-')) {
+    rtor(arr, port.split('-'));
+  } else {
+    arr.push(parseInt(port));
+  }
+}
+
+function squeeze(arr) {
+  const srvarr = [];
+  const ranges = [];
+  for (let port of arr) {
+    srvadd(port, srvarr);
+  }
+  for (let [key, group] of groupBy(enumerate(srvarr), ([index, value]) => index - value)) {
+    const ports = group.map(([index, value]) => value);
+    if (ports[0] === ports[ports.length - 1]) {
+      ranges.push(ports[0].toString());
+    } else {
+      ranges.push(ports[0] + '-' + ports[ports.length - 1]);
+    }
+  }
+  return ranges;
+}
+
+function areNetsIn(net1, net2, netlist) {
+  for (let net of Object.keys(netlist)) {
+    const dsts = netlist[net];
+    if (Array.isArray(dsts)) {
+      for (let dst of dsts) {
+        if (Array.isArray(net) && Array.isArray(dst)) {
+          for (let m of net) {
+            for (let n of dst) {
+              if (net1.includes(m) && net2.includes(n)) {
+                debug(`areNetsIn -- ${net1} is in ${m}, ${net2} is in ${n}`);
+                return true;
+              }
+            }
+          }
+        } else {
+          if (net1.includes(net) && net2.includes(dst)) {
+            debug(`areNetsIn -- ${net1} is in ${net}, ${net2} is in ${dst}`);
+            return true;
+          }
+        }
+      }
+    } else {
+      if (net1.includes(net) && net2.includes(dsts)) {
+        debug(`areNetsIn -- ${net1} is in ${net}, ${net2} is in ${dsts}`);
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+function addNetPair(src, dst, nets) {
+  debug("addNetPair -- Adding new net_pair");
+  debug(src);
+  debug(dst);
+  if (!nets[src]) {
+    nets[src] = [];
+  }
+  if (!nets[src].includes(dst)) {
+    nets[src].push(dst);
+  }
+  debug("addNetPair -- Current nets");
+  debug(nets[src]);
+}
+
+function addSrv(srv, nets, arr) {
+  debug(`addSrv -- adding service ${srv}`);
+  debug("addSrv -- for the following nets");
+  debug(nets);
+  if (!arr[nets]) {
+    arr[nets] = [];
+  }
+  if (!arr[nets].includes(srv)) {
+    arr[nets].push(srv);
+  }
+  debug("addSrv -- after adding");
+  debug(arr[nets]);
+}
+
+
+function groupNets(nets) {
+  const revnets = {};  // nets reversed: { dst: [src1, src2, ...], ... }
+  debug("groupNets -- Begin ====================");
+  debug("groupNets -- Before first phase of grouping (nets)");
+  debug(nets);
+  for (let src of Object.keys(nets)) {
+    debug("groupNets -- The source");
+    debug(src);
+    debug("groupNets -- 1F The destination");
+    debug(nets[src]);
+    nets[src] = netaddr.cidrMerge(nets[src]);
+    debug("groupNets -- 1F After CIDR-merge");
+    debug(nets[src]);
+    if (Object.keys(nets).length === 1) {
+      debug("groupNets -- Only one pair");
+      return { [src]: nets[src] };
+    }
+    for (let dst of nets[src]) {
+      debug("groupNets -- For the destination");
+      debug(dst);
+      if (!revnets[dst]) {
+        revnets[dst] = [];
+      }
+      if (!revnets[dst].includes(src)) {
+        revnets[dst].push(src);
+        debug("groupNets -- Added the following source");
+        debug(src);
+      }
+      debug("groupNets -- Current revnets[dst]");
+      debug(revnets[dst]);
+    }
+  }
+  debug("groupNets -- The result of the first phase of grouping (revnets)");
+  debug(revnets);
+  debug("groupNets -- Second phase of grouping");
+  nets = {};
+  for (let dst of Object.keys(revnets)) {
+    debug("groupNets -- 2F The destination");
+    debug(dst);
+    debug("groupNets -- The corresponfing sources");
+    debug(revnets[dst]);
+    revnets[dst] = netaddr.cidrMerge(revnets[dst]);
+    debug("groupNets -- 2F After CIDR-merge");
+    debug(revnets[dst]);
+    addNetPair(revnets[dst], dst, nets);
+  }
+  debug("groupNets -- The result of grouping (nets)");
+  debug(nets);
+  debug("groupNets -- End ====================");
+  return nets;
+}
+
+rl.question('Enter the path to the policy file (or "-" to read from the console): ', (answer) => {
+    const filename = answer.trim() === '-' ? '-' : require('path').join(__dirname, answer);
+  rl.close();
+
+  const fs = require('fs');
+  const readlineStream = filename === '-' ? process.stdin : fs.createReadStream(filename);
+
+  let counter = 0;
+
+  readlineStream.on('line', (line) => {
+    if (args.verbose) {
+      counter++;
+    }
+    checkLine(line);
+    const [srcaddr, srcmask, dstaddr, dstmask, service] = line.split(' ');
+    const srcnet = new netaddr.IPNetwork(`${srcaddr}/${srcmask}`);
+    const dstnet = new netaddr.IPNetwork(`${dstaddr}/${dstmask}`);
+    if (service.includes('*')) {
+      debug("New star_net pair found");
+      debug(srcnet);
+      debug(dstnet);
+      addNetPair(srcnet, dstnet, starNets);
+      proto = 'ip';
+      port = '*';
+    } else {
+      [proto, port] = service.includes(':') ? service.split(':') : [service, ''];
+    }
+    const pair = [srcnet, dstnet];
+    if (!policy[pair]) {
+      policy[pair] = {};
+    }
+    if (!policy[pair][proto]) {
+      policy[pair][proto] = [];
+    }
+    if (port && !policy[pair][proto].includes(port)) {
+      policy[pair][proto].push(port);
+    }
+  });
+
+  readlineStream.on('close', () => {
+    debug(`${counter} rules in the policy file`);
+    debug(`First iteration is completed. ${Object.keys(policy).length} rules, and ${Object.keys(starNets).length} "allow all" rules found`);
+    debug(policy);
+
+    starNets = groupNets(starNets);
+    debug(`Allow rules are reduced to ${Object.keys(starNets).length}`);
+    debug('Second iteration begins');
+    
+
+    for (let pair of Object.keys(policy)) {
+      if ('ip' in policy[pair] && '*' in policy[pair]['ip']) {
+        debug('Removing *');
+        debug(pair);
+        debug(policy[pair]);
+        delete policy[pair];
+      } else if (areNetsIn(pair[0], pair[1], starNets)) {
+        debug('Removing networks matching starNets');
+        debug(pair);
+        debug(policy[pair]);
+        delete policy[pair];
+      } else {
+        for (let proto of Object.keys(policy[pair])) {
+          if (policy[pair][proto].length > 1) {
+            if ((proto.includes('tcp') || proto.includes('udp')) && !args.nomerge) {
+              policy[pair][proto] = squeeze(policy[pair][proto]);
+            }
+          }
+        }
+        const tmparr = policy[pair];
+        policy[pair] = [];
+        for (let proto of Object.keys(tmparr)) {
+          if (tmparr[proto].length > 0) {
+            for (let port of tmparr[proto]) {
+              policy[pair].push(proto + ':' + port);
+            }
+          } else {
+            policy[pair].push(proto);
+          }
+        }
+      }
+    }
+
+    debug(`Second iteration is completed. ${Object.keys(policy).length} rules left`);
+    debug(policy);
+
+    debug('Third iteration begins');
+
+    for (let pair of Object.keys(policy)) {
+      for (let srv of policy[pair]) {
+        if (!services[srv]) {
+          services[srv] = {};
+        }
+        addNetPair(pair[0], pair[1], services[srv]);
+      }
+    }
+
+    debug(`Third iteration is completed. ${Object.keys(services).length} services are in the policy`);
+    debug(services);
+
+    policy = {};
+
+    debug('Fourth iteration begins');
+
+    for (let srv of Object.keys(services)) {
+      services[srv] = groupNets(services[srv]);
+      for (let src of Object.keys(services[srv])) {
+        addSrv(srv, [src, services[srv][src]], policy);
+      }
+    }
+
+    debug(`Fourth iteration is completed. ${Object.keys(policy).length} rules in the policy, plus ${Object.keys(starNets).length} "allow all" rules`);
+    debug('Modified services');
+    debug(services);
+    debug('Resulting policy');
+    debug(policy);
+
+    for (let nets of Object.keys(policy)) {
+      const src = nets[0].map(n => String(n)).join(',');
+      const dst = nets[1].map(n => String(n)).join(',');
+      const srv = policy[nets].join(',');
+      console.log(src, dst, srv);
+    }
+
+    if (Object.keys(starNets).length > 0) {
+      for (let net of Object.keys(starNets)) {
+        const src = net.map(n => String(n)).join(',');
+        const dst = starNets[net].map(n => String(n)).join(',');
+        console.log(src, dst, '*');
+      }
+    }
+
+    debug(`All done. There are ${Object.keys(policy).length + Object.keys(starNets).length} rules in the policy.`);
+  });
+});
